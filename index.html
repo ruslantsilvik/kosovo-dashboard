@@ -253,7 +253,7 @@ function statusLabel(s) {
 
 function renderCard(item, isOrg) {
   const photoHtml = item.photo
-    ? `<img class="photo" src="${esc(item.photo)}" alt="${esc(item.country||item.name)}" onerror="this.style.display='none'">`
+    ? `<img class="photo" src="${esc(item.photo)}" alt="${esc(item.country||item.name)}" onerror="this.outerHTML='<div class=&quot;photo&quot; style=&quot;display:flex;align-items:center;justify-content:center;font-size:10px;color:var(--muted);&quot;>фото<br>н/д</div>'">`
     : `<div class="photo" style="display:flex;align-items:center;justify-content:center;font-size:10px;color:var(--muted);">фото<br>н/д</div>`;
 
   if (isOrg) {
