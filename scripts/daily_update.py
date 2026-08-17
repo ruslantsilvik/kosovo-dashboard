@@ -1,17 +1,15 @@
 #!/usr/bin/env python3
 """
-Щоденне автооновлення дашборда "Косово та Сербія".
+Автооновлення дашборда "Косово та Сербія" (v8).
 
-Запускається з GitHub Actions. Логіка:
-  1. Читає index.html, витягає JSON-блок <script id="dashboard-data">.
-  2. Питає Claude (Anthropic API, з увімкненим веб-пошуком) про нові
-     датовані події за останні дні по осі Косово / Сербія / Україна / Албанія.
-  3. Жорстко валідує відповідь (дата, тональність, країна, джерела),
-     відсіює дублікати проти вже наявних записів.
-  4. Додає нові записи у belgrade_visit_events, оновлює дати "Останнє оновлення".
-  5. Записує файл назад. Коміт/пуш робить сам workflow.
+Запускається з GitHub Actions раз на три дні. Оновлює три розділи:
+  1. belgrade_visit_events — новини по осі Косово/Сербія/Україна/Албанія
+  2. russia_reaction.items — реакція російських медіа та офіційних осіб
+  3. serbia_crime.items    — злочинність, правоохоронні органи, резонансні події в Сербії
 
-Нічого не вигадує: запис без реального URL-джерела відкидається.
+Кожен розділ шукається окремим запитом до Anthropic API з увімкненим веб-пошуком.
+Збій одного розділу не зупиняє інші. Нічого не вигадується: запис без реального
+URL-джерела відкидається, дублікати відсіюються за нормалізованим заголовком.
 """
 
 import json
@@ -31,7 +29,6 @@ DATA_RE = re.compile(
     r'(<script id="dashboard-data" type="application/json">)(.*?)(</script>)', re.S
 )
 
-# Моделі пробуються по черзі — якщо ID застаріє, скрипт не впаде.
 MODEL_CANDIDATES = [
     m.strip()
     for m in os.environ.get(
@@ -41,19 +38,25 @@ MODEL_CANDIDATES = [
     if m.strip()
 ]
 
+LOOKBACK_DAYS = int(os.environ.get("LOOKBACK_DAYS", "5"))
+MAX_NEW_ITEMS = int(os.environ.get("MAX_NEW_ITEMS", "6"))
+MAX_SEARCH_USES = int(os.environ.get("MAX_SEARCH_USES", "5"))
+
 ALLOWED_COUNTRIES = {"kosovo", "serbia", "ukraine", "albania"}
 ALLOWED_TONES = {"support", "friction", "neutral"}
-LOOKBACK_DAYS = int(os.environ.get("LOOKBACK_DAYS", "4"))
-MAX_NEW_ITEMS = int(os.environ.get("MAX_NEW_ITEMS", "6"))
-
-UA_MONTHS = {
-    1: "січня", 2: "лютого", 3: "березня", 4: "квітня", 5: "травня", 6: "червня",
-    7: "липня", 8: "серпня", 9: "вересня", 10: "жовтня", 11: "листопада", 12: "грудня",
+ALLOWED_RU_TONES = {"hostile", "negative", "neutral"}
+ALLOWED_RU_TYPES = {
+    "russian_state_media", "russian_official", "russian_other", "third_party_reporting",
 }
+ALLOWED_CRIME_CATS = {
+    "organized_crime", "corruption", "economic_crime",
+    "violent_crime", "public_order", "institutions",
+}
+ALLOWED_SEVERITY = {"high", "medium", "low"}
 
 
 # --------------------------------------------------------------------------- #
-# HTML / JSON I/O
+# I/O
 # --------------------------------------------------------------------------- #
 
 def load_html():
@@ -64,7 +67,7 @@ def load_html():
 def extract_data(html):
     m = DATA_RE.search(html)
     if not m:
-        sys.exit("Не знайдено блок <script id=\"dashboard-data\"> у index.html")
+        sys.exit('Не знайдено блок <script id="dashboard-data"> у index.html')
     return json.loads(m.group(2)), m
 
 
@@ -79,7 +82,7 @@ def write_html(html, data, match):
 
 
 # --------------------------------------------------------------------------- #
-# Нормалізація / дедуплікація
+# Утиліти
 # --------------------------------------------------------------------------- #
 
 def norm_title(text):
@@ -87,170 +90,226 @@ def norm_title(text):
     return re.sub(r"[^\w]+", " ", text, flags=re.UNICODE).strip()
 
 
-def existing_keys(events):
-    keys = set()
-    for e in events:
-        keys.add(norm_title(e.get("title")))
-    return keys
+def valid_date(value, today, extra_slack=10):
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(value or "")):
+        return None
+    try:
+        d = date.fromisoformat(value)
+    except ValueError:
+        return None
+    if d > today:
+        return None
+    if d < today - timedelta(days=LOOKBACK_DAYS + extra_slack):
+        return None
+    return value
 
 
-# --------------------------------------------------------------------------- #
-# Запит до Claude
-# --------------------------------------------------------------------------- #
-
-def build_prompt(data, today):
-    events = sorted(data.get("belgrade_visit_events", []), key=lambda e: e.get("date", ""))
-    recent = events[-14:]
-    known = "\n".join(f"- {e.get('date')} [{e.get('country')}] {e.get('title')}" for e in recent)
-    since = (today - timedelta(days=LOOKBACK_DAYS)).isoformat()
-
-    return f"""Сьогодні {today.isoformat()}. Ти — дослідник-аналітик для представництва Торгово-промислової палати України в Косові.
-
-Знайди через веб-пошук РЕАЛЬНІ, ДАТОВАНІ новини та події за період з {since} по {today.isoformat()} за темами:
-- українсько-косовські та українсько-сербські відносини;
-- візити, заяви, рішення офіційних осіб Косова, Сербії, України, Албанії щодо цієї осі;
-- торговельні та дипломатичні події між цими країнами;
-- призначення / зміни послів у Косові та Сербії;
-- ділові заходи (бізнес-форуми, конференції, торговельні місії) у Приштині та Белграді.
-
-Шукай українською, англійською, сербською та албанською.
-
-Ці записи ВЖЕ Є в дашборді — не повторюй їх і не переказуй іншими словами:
-{known or "(порожньо)"}
-
-КРИТИЧНІ ПРАВИЛА:
-1. Нічого не вигадуй. Кожен запис мусить спиратись на конкретну веб-сторінку, яку ти реально знайшов, з робочим URL.
-2. Якщо за цей період не знайшлося нічого суттєво нового — поверни порожній масив. Порожній результат це нормально і краще, ніж притягнутий за вуха.
-3. Не додавай загальних оглядів війни в Україні без прямого стосунку до Косова/Сербії/Балкан.
-4. date — реальна дата події або публікації, формат YYYY-MM-DD, не в майбутньому.
-5. Максимум {MAX_NEW_ITEMS} записів.
-
-Формат відповіді — ЛИШЕ JSON усередині тегів <result></result>, без пояснень поза тегами:
-
-<result>
-{{"news": [
-  {{
-    "date": "YYYY-MM-DD",
-    "country": "kosovo|serbia|ukraine|albania",
-    "tone": "support|friction|neutral",
-    "title": "Стислий заголовок українською (до 200 символів)",
-    "text": "1-2 речення суті українською",
-    "sources": [["Назва видання", "https://..."]]
-  }}
-]}}
-</result>"""
+def clean_sources(raw):
+    out = []
+    for s in raw or []:
+        if isinstance(s, (list, tuple)) and len(s) >= 2:
+            label, url = str(s[0]).strip(), str(s[1]).strip()
+            if url.startswith(("http://", "https://")):
+                out.append([label or url, url])
+    return out
 
 
-def call_claude(prompt):
+def call_claude(prompt, label):
     client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
     last_error = None
-
     for model in MODEL_CANDIDATES:
         try:
-            print(f"[api] пробую модель: {model}")
+            print(f"[api:{label}] модель {model}")
             resp = client.messages.create(
                 model=model,
                 max_tokens=4000,
-                tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 8}],
+                tools=[{"type": "web_search_20250305", "name": "web_search",
+                        "max_uses": MAX_SEARCH_USES}],
                 messages=[{"role": "user", "content": prompt}],
             )
             text = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
-            print(f"[api] модель {model} відповіла, {len(text)} символів тексту")
+            print(f"[api:{label}] відповідь {len(text)} символів")
             return text
-        except Exception as exc:  # noqa: BLE001 — свідомо ловимо будь-що і пробуємо далі
+        except Exception as exc:  # noqa: BLE001
             last_error = exc
-            print(f"[api] модель {model} не спрацювала: {exc}")
-
+            print(f"[api:{label}] модель {model} не спрацювала: {exc}")
     raise RuntimeError(f"Жодна модель не спрацювала. Остання помилка: {last_error}")
 
 
-def parse_response(text):
+def parse_json_block(text, key):
     m = re.search(r"<result>(.*?)</result>", text, re.S)
     blob = m.group(1) if m else text
     blob = re.sub(r"^\s*```(?:json)?|```\s*$", "", blob.strip(), flags=re.M).strip()
     start, end = blob.find("{"), blob.rfind("}")
     if start == -1 or end == -1:
-        print("[parse] JSON у відповіді не знайдено — вважаю, що нових подій нема")
+        print(f"[parse:{key}] JSON не знайдено — вважаю, що нового нема")
         return []
     try:
-        parsed = json.loads(blob[start : end + 1])
+        parsed = json.loads(blob[start:end + 1])
     except json.JSONDecodeError as exc:
-        print(f"[parse] не вдалося розібрати JSON ({exc}) — пропускаю додавання")
+        print(f"[parse:{key}] не вдалося розібрати JSON ({exc})")
         return []
-    items = parsed.get("news", [])
+    items = parsed.get(key, [])
     return items if isinstance(items, list) else []
 
 
 # --------------------------------------------------------------------------- #
-# Валідація
+# Розділ 1: новини
 # --------------------------------------------------------------------------- #
 
-def validate(items, data, today):
-    seen = existing_keys(data.get("belgrade_visit_events", []))
-    oldest_ok = today - timedelta(days=LOOKBACK_DAYS + 10)
-    good = []
+def prompt_news(data, today):
+    events = sorted(data.get("belgrade_visit_events", []), key=lambda e: e.get("date", ""))
+    known = "\n".join(f"- {e.get('date')} [{e.get('country')}] {e.get('title')}" for e in events[-14:])
+    since = (today - timedelta(days=LOOKBACK_DAYS)).isoformat()
+    return f"""Сьогодні {today.isoformat()}. Знайди через веб-пошук РЕАЛЬНІ ДАТОВАНІ новини за період з {since} по {today.isoformat()} за темами: українсько-косовські та українсько-сербські відносини; візити й заяви офіційних осіб Косова, Сербії, України, Албанії щодо цієї осі; торговельні та дипломатичні події; призначення послів у Косові та Сербії; ділові заходи в Приштині та Белграді.
 
+Шукай українською, англійською, сербською, албанською.
+
+Уже є в дашборді, не повторюй:
+{known or "(порожньо)"}
+
+ПРАВИЛА: нічого не вигадуй; кожен запис — з робочим URL реальної сторінки; якщо нічого суттєвого нема, поверни порожній масив (це нормально); date — реальна дата, YYYY-MM-DD, не в майбутньому; максимум {MAX_NEW_ITEMS} записів.
+
+Відповідь — ЛИШЕ JSON у тегах <result></result>:
+<result>
+{{"news": [{{"date":"YYYY-MM-DD","country":"kosovo|serbia|ukraine|albania","tone":"support|friction|neutral","title":"заголовок українською до 200 символів","text":"1-2 речення суті українською","sources":[["Видання","https://..."]]}}]}}
+</result>"""
+
+
+def validate_news(items, data, today):
+    seen = {norm_title(e.get("title")) for e in data.get("belgrade_visit_events", [])}
+    good = []
     for raw in items:
         if not isinstance(raw, dict):
             continue
         title = str(raw.get("title") or "").strip()
-        d = str(raw.get("date") or "").strip()
-        country = str(raw.get("country") or "").strip().lower()
-        tone = str(raw.get("tone") or "neutral").strip().lower()
-
-        if not title or len(title) > 300:
-            print(f"[skip] порожній або задовгий заголовок: {title[:60]!r}")
-            continue
-        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", d):
-            print(f"[skip] некоректна дата {d!r} у {title[:50]!r}")
-            continue
-        try:
-            parsed_date = date.fromisoformat(d)
-        except ValueError:
-            print(f"[skip] нерозбірлива дата {d!r}")
-            continue
-        if parsed_date > today:
-            print(f"[skip] дата в майбутньому {d} у {title[:50]!r}")
-            continue
-        if parsed_date < oldest_ok:
-            print(f"[skip] застара подія {d} у {title[:50]!r}")
-            continue
-        if country not in ALLOWED_COUNTRIES:
-            print(f"[skip] невідома країна {country!r} у {title[:50]!r}")
-            continue
-        if tone not in ALLOWED_TONES:
-            tone = "neutral"
-
-        sources = []
-        for s in raw.get("sources") or []:
-            if isinstance(s, (list, tuple)) and len(s) >= 2:
-                label, url = str(s[0]).strip(), str(s[1]).strip()
-                if url.startswith(("http://", "https://")):
-                    sources.append([label or url, url])
-        if not sources:
-            print(f"[skip] немає робочого джерела у {title[:50]!r}")
-            continue
-
+        d = valid_date(raw.get("date"), today)
+        country = str(raw.get("country") or "").lower().strip()
+        tone = str(raw.get("tone") or "neutral").lower().strip()
+        sources = clean_sources(raw.get("sources"))
         key = norm_title(title)
-        if key in seen:
-            print(f"[skip] дублікат: {title[:60]!r}")
+        if not title or len(title) > 300 or not d or country not in ALLOWED_COUNTRIES \
+                or not sources or key in seen:
+            print(f"[skip:news] {title[:60]!r}")
             continue
         seen.add(key)
-
-        good.append({
-            "date": d,
-            "country": country,
-            "tone": tone,
-            "title": title,
-            "text": str(raw.get("text") or "").strip(),
-            "sources": sources,
-        })
-
+        good.append({"date": d, "country": country,
+                     "tone": tone if tone in ALLOWED_TONES else "neutral",
+                     "title": title, "text": str(raw.get("text") or "").strip(),
+                     "sources": sources})
     return good[:MAX_NEW_ITEMS]
 
 
 # --------------------------------------------------------------------------- #
-# Оновлення приміток про дату
+# Розділ 2: реакція РФ
+# --------------------------------------------------------------------------- #
+
+def prompt_russia(data, today):
+    block = data.get("russia_reaction") or {}
+    items = sorted(block.get("items", []), key=lambda e: e.get("date", ""))
+    known = "\n".join(f"- {e.get('date')} {e.get('outlet')}: {e.get('title')}" for e in items[-12:])
+    since = (today - timedelta(days=LOOKBACK_DAYS)).isoformat()
+    return f"""Сьогодні {today.isoformat()}. Ти ведеш медіа-моніторинг для представництва Торгово-промислової палати України. Знайди через веб-пошук РЕАЛЬНІ ДАТОВАНІ публікації російських медіа та заяви російських офіційних осіб за період з {since} по {today.isoformat()} щодо: зближення Сербії та України, візиту Зеленського до Белграда та його наслідків, постачання сербських боєприпасів Україні, торговельних переговорів Києва і Белграда.
+
+Джерела для перевірки: РИА Новости, ТАСС, Коммерсантъ, RT, ВЗГЛЯД, Известия, Российская газета, Lenta, Газета.ру, Sputnik Serbia; заяви МЗС РФ (Захарова, Лавров), посольства РФ у Белграді, депутатів Держдуми. Також приймаються матеріали сербських і західних медіа ПРО російську реакцію (Danas, N1, Balkan Insight, RFE/RL) — познач їх типом third_party_reporting.
+
+Уже є в дашборді, не повторюй:
+{known or "(порожньо)"}
+
+ПРАВИЛА: нічого не вигадуй; кожен запис — з робочим URL; цитата (quote) необов'язкова, МАКСИМУМ 15 слів мовою оригіналу, тільки якщо справді показова, інакше null; ніколи не вигадуй цитат; якщо нічого нового нема — порожній масив; максимум {MAX_NEW_ITEMS} записів.
+
+tone — твоя класифікація ворожості до України: "hostile" (різко ворожа риторика, звинувачення), "negative" (критично, але стримано), "neutral" (фактичний виклад без оцінок).
+
+Відповідь — ЛИШЕ JSON у тегах <result></result>:
+<result>
+{{"russia": [{{"date":"YYYY-MM-DD","outlet":"назва видання або ім'я і посада особи","outlet_type":"russian_state_media|russian_official|russian_other|third_party_reporting","title":"що саме опубліковано чи сказано, українською, до 200 символів","quote":null,"tone":"hostile|negative|neutral","url":"https://..."}}]}}
+</result>"""
+
+
+def validate_russia(items, data, today):
+    block = data.get("russia_reaction") or {}
+    seen = {norm_title(e.get("title")) for e in block.get("items", [])}
+    good = []
+    for raw in items:
+        if not isinstance(raw, dict):
+            continue
+        title = str(raw.get("title") or "").strip()
+        d = valid_date(raw.get("date"), today)
+        url = str(raw.get("url") or "").strip()
+        otype = str(raw.get("outlet_type") or "").strip()
+        tone = str(raw.get("tone") or "neutral").lower().strip()
+        outlet = str(raw.get("outlet") or "").strip()
+        key = norm_title(title)
+        if not title or len(title) > 300 or not d or not outlet \
+                or not url.startswith(("http://", "https://")) \
+                or otype not in ALLOWED_RU_TYPES or key in seen:
+            print(f"[skip:russia] {title[:60]!r}")
+            continue
+        quote = raw.get("quote")
+        quote = str(quote).strip() if quote else None
+        if quote and len(quote.split()) > 20:
+            quote = None  # задовга цитата — краще без неї
+        seen.add(key)
+        good.append({"date": d, "outlet": outlet, "outlet_type": otype, "title": title,
+                     "quote": quote,
+                     "tone": tone if tone in ALLOWED_RU_TONES else "neutral", "url": url})
+    return good[:MAX_NEW_ITEMS]
+
+
+# --------------------------------------------------------------------------- #
+# Розділ 3: злочинність у Сербії
+# --------------------------------------------------------------------------- #
+
+def prompt_crime(data, today):
+    block = data.get("serbia_crime") or {}
+    items = sorted(block.get("items", []), key=lambda e: e.get("date", ""))
+    known = "\n".join(f"- {e.get('date')} [{e.get('category')}] {e.get('title')}" for e in items[-12:])
+    since = (today - timedelta(days=LOOKBACK_DAYS)).isoformat()
+    return f"""Сьогодні {today.isoformat()}. Ти аналітик представництва Торгово-промислової палати України. Знайди через веб-пошук РЕАЛЬНІ ДАТОВАНІ події в Сербії за період з {since} по {today.isoformat()} за темами: організована злочинність (кланові війни, затримання, наркотрафік); корупція (гучні справи, посадовці, держзакупівлі); економічні злочини (контрабанда, митниця, ухилення від податків, відмивання); насильницькі злочини та резонансні події (вбивства, вибухи, великі аварії); громадський порядок (протести, сутички з поліцією); правоохоронні інституції (МВС, прокуратура, BIA — кадрові зміни, критика, реформи).
+
+Шукай сербською, англійською, російською. Надійні джерела: RFE/RL (Slobodna Evropa), Vreme, Danas, N1, KRIK, Nedeljnik, RTS, B92, Balkan Insight, Europol, Єврокомісія. НЕ використовуй сербські таблоїди (Kurir, Informer, Telegraf, Republika) як єдине джерело.
+
+Уже є в дашборді, не повторюй:
+{known or "(порожньо)"}
+
+ПРАВИЛА: нічого не вигадуй; кожен запис — щонайменше з одним робочим URL; не вигадуй дат і чисел; якщо нічого суттєвого нема — порожній масив; максимум {MAX_NEW_ITEMS} записів.
+
+Відповідь — ЛИШЕ JSON у тегах <result></result>:
+<result>
+{{"crime": [{{"date":"YYYY-MM-DD","category":"organized_crime|corruption|economic_crime|violent_crime|public_order|institutions","severity":"high|medium|low","title":"заголовок українською до 180 символів","text":"1-3 речення українською, до 400 символів","place":"місто або «загальнонаціонально»","business_relevance":"коротко, чим це важливо для іноземної компанії, або null","sources":[["Видання","https://..."]]}}]}}
+</result>"""
+
+
+def validate_crime(items, data, today):
+    block = data.get("serbia_crime") or {}
+    seen = {norm_title(e.get("title")) for e in block.get("items", [])}
+    good = []
+    for raw in items:
+        if not isinstance(raw, dict):
+            continue
+        title = str(raw.get("title") or "").strip()
+        d = valid_date(raw.get("date"), today)
+        cat = str(raw.get("category") or "").strip()
+        sev = str(raw.get("severity") or "medium").strip()
+        sources = clean_sources(raw.get("sources"))
+        key = norm_title(title)
+        if not title or len(title) > 300 or not d or cat not in ALLOWED_CRIME_CATS \
+                or not sources or key in seen:
+            print(f"[skip:crime] {title[:60]!r}")
+            continue
+        br = raw.get("business_relevance")
+        br = str(br).strip() if br else None
+        seen.add(key)
+        good.append({"date": d, "category": cat,
+                     "severity": sev if sev in ALLOWED_SEVERITY else "medium",
+                     "title": title, "text": str(raw.get("text") or "").strip(),
+                     "place": str(raw.get("place") or "").strip(),
+                     "business_relevance": br, "sources": sources})
+    return good[:MAX_NEW_ITEMS]
+
+
+# --------------------------------------------------------------------------- #
+# Примітки про дату
 # --------------------------------------------------------------------------- #
 
 def set_note(html, marker, text):
@@ -258,27 +317,30 @@ def set_note(html, marker, text):
         r'(<p class="updated-note" data-auto="' + re.escape(marker) + r'">)(.*?)(</p>)', re.S
     )
     if not pattern.search(html):
-        print(f"[note] маркер {marker} не знайдено — пропускаю")
+        print(f"[note] маркер {marker} не знайдено")
         return html
-    return pattern.sub(lambda m: m.group(1) + text + m.group(3), html, count=1)
+    return pattern.sub(lambda mm: mm.group(1) + text + mm.group(3), html, count=1)
 
 
-def update_notes(html, today, added):
+def update_notes(html, today, counts):
     d = today.strftime("%d.%m.%Y")
-    if added:
-        news = (f"Останнє оновлення: {d} (автоматична щоденна перевірка). "
-                f"Цього разу додано нових записів: {added}. Кожен запис має джерело — перевіряйте за посиланням.")
-    else:
-        news = (f"Останнє оновлення: {d} (автоматична щоденна перевірка). "
-                f"Нових суттєвих датованих подій за останні дні не знайдено — записів не додано, "
-                f"навмисно без «порожніх» карток.")
-    events = (f"Перевірка — щоденно в автоматичному режимі. Останній прогін: {d}. "
-              f"Перелік заходів оновлюється рідше за новини — перевіряйте дати на сайтах організаторів.")
 
-    html = set_note(html, "news-kosovo", news)
-    html = set_note(html, "news-serbia", news)
-    html = set_note(html, "events-kosovo", events)
-    html = set_note(html, "events-serbia", events)
+    def phrase(n, what):
+        return (f"Останній прогін: {d}. Додано нових записів: {n}."
+                if n else
+                f"Останній прогін: {d}. Нових {what} не знайдено — записів не додано, "
+                f"навмисно без «порожніх» карток.")
+
+    news = f"Оновлюється автоматично раз на три дні. {phrase(counts.get('news', 0), 'датованих подій')}"
+    events = (f"Перевірка — автоматично раз на три дні. Останній прогін: {d}. "
+              f"Перелік заходів оновлюється рідше за новини — перевіряйте дати на сайтах організаторів.")
+    russia = f"Оновлюється автоматично раз на три дні. {phrase(counts.get('russia', 0), 'публікацій')}"
+    crime = f"Оновлюється автоматично раз на три дні. {phrase(counts.get('crime', 0), 'подій')}"
+
+    for marker, text in (("news-kosovo", news), ("news-serbia", news),
+                         ("events-kosovo", events), ("events-serbia", events),
+                         ("russia-note", russia), ("crime-note", crime)):
+        html = set_note(html, marker, text)
     return html
 
 
@@ -286,54 +348,73 @@ def update_notes(html, today, added):
 # main
 # --------------------------------------------------------------------------- #
 
+SECTIONS = [
+    # (ключ, json-ключ відповіді, prompt-функція, validate-функція, куди складати)
+    ("news", "news", prompt_news, validate_news, None),
+    ("russia", "russia", prompt_russia, validate_russia, "russia_reaction"),
+    ("crime", "crime", prompt_crime, validate_crime, "serbia_crime"),
+]
+
+
 def main():
     today = datetime.now(timezone.utc).date()
     html = load_html()
     data, match = extract_data(html)
 
-    before = len(data.get("belgrade_visit_events", []))
-    print(f"[start] {today} — у дашборді зараз {before} новинних записів")
+    counts = {}
+    skip = os.environ.get("SKIP_SEARCH") == "1"
+    if skip:
+        print("[start] SKIP_SEARCH=1 — пошук пропущено")
 
-    added_items = []
-    if os.environ.get("SKIP_SEARCH") == "1":
-        print("[start] SKIP_SEARCH=1 — пошук пропущено, лише оновлюю дати")
-    else:
+    for key, json_key, make_prompt, validate, container in SECTIONS:
+        counts[key] = 0
+        if skip:
+            continue
         try:
-            raw_text = call_claude(build_prompt(data, today))
-            added_items = validate(parse_response(raw_text), data, today)
+            raw_text = call_claude(make_prompt(data, today), key)
+            found = validate(parse_json_block(raw_text, json_key), data, today)
         except Exception as exc:  # noqa: BLE001
-            print(f"[error] пошук не вдався: {exc}")
-            print("[error] продовжую без нових записів — дати все одно оновлю")
+            print(f"[error:{key}] {exc} — продовжую без цього розділу")
+            continue
 
-    if added_items:
-        data.setdefault("belgrade_visit_events", []).extend(added_items)
-        data["belgrade_visit_events"].sort(key=lambda e: e.get("date", ""), reverse=True)
-        for it in added_items:
-            print(f"[add] {it['date']} [{it['country']}/{it['tone']}] {it['title'][:90]}")
-    else:
-        print("[add] нових записів немає")
+        if not found:
+            print(f"[add:{key}] нових записів немає")
+            continue
+
+        if container is None:
+            data.setdefault("belgrade_visit_events", []).extend(found)
+            data["belgrade_visit_events"].sort(key=lambda e: e.get("date", ""), reverse=True)
+        else:
+            block = data.setdefault(container, {})
+            block.setdefault("items", []).extend(found)
+            block["items"].sort(key=lambda e: e.get("date", ""), reverse=True)
+
+        counts[key] = len(found)
+        for it in found:
+            print(f"[add:{key}] {it['date']} {it['title'][:80]}")
 
     data["generated"] = today.strftime("%d.%m.%Y")
     data["last_auto_check"] = today.isoformat()
 
     html = write_html(html, data, match)
-    html = update_notes(html, today, len(added_items))
+    html = update_notes(html, today, counts)
     with open(HTML_PATH, "w", encoding="utf-8") as fh:
         fh.write(html)
 
-    # Перевірка, що файл лишився валідним
-    check_data, _ = extract_data(load_html())
-    after = len(check_data.get("belgrade_visit_events", []))
-    print(f"[done] новинних записів: було {before}, стало {after}")
+    check, _ = extract_data(load_html())
+    print(f"[done] новини={len(check.get('belgrade_visit_events', []))} "
+          f"РФ={len((check.get('russia_reaction') or {}).get('items', []))} "
+          f"криміналітет={len((check.get('serbia_crime') or {}).get('items', []))}")
 
-    summary = (f"Оновлення {today.strftime('%d.%m')}: додано {len(added_items)} новин"
-               if added_items else
-               f"Оновлення {today.strftime('%d.%m')}: нових подій не знайдено, оновлено дати перевірки")
+    total = sum(counts.values())
+    parts = [f"{k}+{v}" for k, v in counts.items() if v]
+    summary = (f"Оновлення {today.strftime('%d.%m')}: {', '.join(parts)}"
+               if total else
+               f"Оновлення {today.strftime('%d.%m')}: нового не знайдено, оновлено дати перевірки")
     gh_out = os.environ.get("GITHUB_OUTPUT")
     if gh_out:
         with open(gh_out, "a", encoding="utf-8") as fh:
-            fh.write(f"summary={summary}\n")
-            fh.write(f"added={len(added_items)}\n")
+            fh.write(f"summary={summary}\nadded={total}\n")
     print(f"[summary] {summary}")
 
 
