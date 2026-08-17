@@ -2,9 +2,12 @@ name: Щоденне оновлення дашборда
 
 on:
   schedule:
-    # 06:10 UTC щодня. GitHub інколи затримує запуск на кілька хвилин — це нормально.
-    - cron: "10 6 * * *"
+    # Раз на три дні о 06:10 UTC (дні місяця 1, 4, 7, ... 28, 31).
+    # На межі місяця проміжок може скоротитись до 1-2 днів — це нормально,
+    # скрипт дивиться на 5 днів назад і відсіює дублікати.
+    - cron: "10 6 */3 * *"
   workflow_dispatch:
+    # Ручний запуск із вкладки Actions.
 
 permissions:
   contents: write
@@ -16,7 +19,7 @@ concurrency:
 jobs:
   update:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
 
     steps:
       - name: Забрати репозиторій
@@ -34,6 +37,9 @@ jobs:
         id: update
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          LOOKBACK_DAYS: "5"
+          MAX_SEARCH_USES: "5"
+          MAX_NEW_ITEMS: "6"
         run: python scripts/daily_update.py
 
       - name: Закомітити зміни
