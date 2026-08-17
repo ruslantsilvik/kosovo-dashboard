@@ -1,0 +1,50 @@
+name: Щоденне оновлення дашборда
+
+on:
+  schedule:
+    # 06:10 UTC щодня. GitHub інколи затримує запуск на кілька хвилин — це нормально.
+    - cron: "10 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: daily-dashboard-update
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Забрати репозиторій
+        uses: actions/checkout@v4
+
+      - name: Налаштувати Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Встановити залежності
+        run: pip install --quiet "anthropic>=0.40"
+
+      - name: Оновити дашборд
+        id: update
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: python scripts/daily_update.py
+
+      - name: Закомітити зміни
+        run: |
+          if git diff --quiet -- index.html; then
+            echo "index.html не змінився — коміт не потрібен"
+            exit 0
+          fi
+          git config user.name "kosovo-dashboard-bot"
+          git config user.email "actions@github.com"
+          git add index.html
+          git commit -m "${{ steps.update.outputs.summary || 'Автооновлення дашборда' }}"
+          git push origin HEAD:main
+          echo "Зміни запушено — OVH підхопить і задеплоїть"
